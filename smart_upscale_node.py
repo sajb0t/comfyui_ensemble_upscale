@@ -707,6 +707,25 @@ def _combine_bands(lows, highs, weights):
     return out
 
 
+def _plain_enlarge(src, out_h, out_w):
+    """Bicubic enlarge. This is the picture with no model detail."""
+    if src.shape[-2] == out_h and src.shape[-1] == out_w:
+        return src
+    return F.interpolate(
+        src, size=(int(out_h), int(out_w)), mode="bicubic", align_corners=False,
+    ).clamp(0.0, 1.0)
+
+
+def _apply_upscale_strength(result, src, strength):
+    """Fade the ensemble toward a plain enlarge, or push its detail further."""
+    if strength == 1:
+        return result
+    plain = _plain_enlarge(src, result.shape[-2], result.shape[-1])
+    if plain.device != result.device or plain.dtype != result.dtype:
+        plain = plain.to(device=result.device, dtype=result.dtype)
+    return (plain + (result - plain) * strength).clamp(0.0, 1.0)
+
+
 def _area_shrink(img, out_h, out_w):
     """Mean of the source pixels that cover each output pixel."""
     _, _, h, w = img.shape
@@ -1111,7 +1130,7 @@ def _fit_face(face, height, width):
     ).clamp(0.0, 1.0)
 
 
-def _enhance_faces(result, src, boxes, face_model, tile_size, overlap, pbar=None):
+def _enhance_faces(result, src, boxes, face_model, tile_size, overlap, pbar=None, strength=1.0):
     """Upscale each face from the source and feather it onto ``result``."""
     device = src.device
     scale = _model_scale(face_model)
@@ -1173,7 +1192,7 @@ def _enhance_faces(result, src, boxes, face_model, tile_size, overlap, pbar=None
                 )
                 region = result[index:index + 1, :, oy0:oy1, ox0:ox1]
                 result[index:index + 1, :, oy0:oy1, ox0:ox1] = (
-                    region * (1.0 - mask) + fitted * mask
+                    region + (fitted - region) * mask * strength
                 ).clamp(0.0, 1.0)
     finally:
         _model_to(face_model, "cpu")
@@ -1279,6 +1298,14 @@ class SmartEnsembleUpscale:
                     "default": _FACE_MODEL,
                     "tooltip": "Upscale model used only on detected faces. 4xFaceUpDAT is trained on faces. It is downloaded if missing and download missing is on.",
                 }),
+                "face_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "How strongly the face model replaces the ensemble on each detected face. 1 is the face model as it is. Lower fades it back toward the ensemble. Higher exaggerates that detail. 0 skips the face pass. Presets do not change this.",
+                }),
+                "upscale_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "How strongly the upscale models replace a plain enlargement. 1 is the ensemble as it is. Lower fades detail back toward that plain resize. Higher exaggerates it. 0 skips the models and only enlarges the picture. Grain, the photo filter, and face strength stay separate. Presets do not change this.",
+                }),
             },
         }
 
@@ -1294,7 +1321,8 @@ class SmartEnsembleUpscale:
                 model_1_name=_NONE, model_2_name=_NONE, model_3_name=_NONE,
                 download_missing=True, texture_smooth=0.0, reduce_grid=0.0,
                 noise=0.03, photo_filter=_PHOTO_NONE, noise_seed=0,
-                face_enhance=False, face_model_name=_FACE_MODEL):
+                face_enhance=False, face_model_name=_FACE_MODEL,
+                face_strength=1.0, upscale_strength=1.0):
         """
         Main entry point called by ComfyUI.
 
@@ -1338,33 +1366,40 @@ class SmartEnsembleUpscale:
             primary_scale = _model_scale(models[0])
             target_h, target_w = in_h * primary_scale, in_w * primary_scale
             target_hw = (target_h, target_w)
-            ys, xs = _tile_geometry(in_h, in_w, tile_size, tile_overlap)
-            n_tiles = len(ys) * len(xs)
-            pbar = tqdm(
-                total=len(moved) * n_tiles,
-                desc="SmartEnsembleUpscale",
-                unit="tile",
-            )
-
-            if frequency_split:
-                result = self._frequency_separated_upscale(
-                    models, rgb, target_hw, tile_size, tile_overlap,
-                    blend_mode, model_names, pbar,
-                )
-            else:
-                result = _ensemble_upscale(
-                    models, rgb, target_hw, tile_size, tile_overlap,
-                    blend_mode, model_names, pbar,
-                )
-            # Shrink by averaging the source pixels that fall into each
-            # output pixel. 0.5 on a 4× model is a 2×2 mean, not a second
-            # bicubic pass.
             if output_scale < 0.999:
                 final_h = max(1, int(round(target_h * output_scale)))
                 final_w = max(1, int(round(target_w * output_scale)))
-                result = _area_shrink(result, final_h, final_w)
+            else:
+                final_h, final_w = target_h, target_w
 
-            if face_enhance:
+            if upscale_strength == 0:
+                result = _plain_enlarge(rgb, final_h, final_w)
+            else:
+                ys, xs = _tile_geometry(in_h, in_w, tile_size, tile_overlap)
+                n_tiles = len(ys) * len(xs)
+                pbar = tqdm(
+                    total=len(moved) * n_tiles,
+                    desc="SmartEnsembleUpscale",
+                    unit="tile",
+                )
+                if frequency_split:
+                    result = self._frequency_separated_upscale(
+                        models, rgb, target_hw, tile_size, tile_overlap,
+                        blend_mode, model_names, pbar,
+                    )
+                else:
+                    result = _ensemble_upscale(
+                        models, rgb, target_hw, tile_size, tile_overlap,
+                        blend_mode, model_names, pbar,
+                    )
+                # Shrink by averaging the source pixels that fall into each
+                # output pixel. 0.5 on a 4× model is a 2×2 mean, not a second
+                # bicubic pass.
+                if output_scale < 0.999:
+                    result = _area_shrink(result, final_h, final_w)
+                result = _apply_upscale_strength(result, rgb, upscale_strength)
+
+            if face_enhance and face_strength > 0:
                 face_boxes = _detect_face_boxes(rgb)
                 if any(face_boxes) and _safe_model_filename(face_model_name):
                     face_model = _load_named_upscale_model(
@@ -1374,7 +1409,7 @@ class SmartEnsembleUpscale:
                         moved.append(face_model)
                         result = _enhance_faces(
                             result, rgb, face_boxes, face_model,
-                            tile_size, tile_overlap, pbar,
+                            tile_size, tile_overlap, pbar, face_strength,
                         )
                 elif not any(face_boxes):
                     logging.info("SmartEnsembleUpscale: no frontal face found")
