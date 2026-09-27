@@ -1343,7 +1343,7 @@ class SmartEnsembleUpscale:
                     "tooltip": "How strongly the upscale models replace a plain enlargement. 1 is the ensemble as it is. Lower fades detail back toward that plain resize. Higher exaggerates it. 0 skips the models and only enlarges the picture. Grain, the photo filter, and face strength stay separate. Presets do not change this.",
                 }),
                 "keep_soft": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Leaves soft areas as they were in the original. 1 fades detail the models invent where the original had little fine detail, such as bokeh. Sharp areas keep the models. 0 is off. Presets do not change this.",
                 }),
             },
@@ -1362,7 +1362,7 @@ class SmartEnsembleUpscale:
                 download_missing=True, texture_smooth=0.0, reduce_grid=0.0,
                 noise=0.03, photo_filter=_PHOTO_NONE, noise_seed=0,
                 face_enhance=False, face_model_name=_FACE_MODEL,
-                face_strength=1.0, upscale_strength=1.0, keep_soft=1.0):
+                face_strength=1.0, upscale_strength=1.0, keep_soft=0.5):
         """
         Main entry point called by ComfyUI.
 
