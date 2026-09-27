@@ -742,9 +742,37 @@ def _area_shrink(img, out_h, out_w):
     return F.interpolate(img, size=(out_h, out_w), mode="area").clamp(0.0, 1.0)
 
 
-def _bicubic_rows(src, row0, row1, out_h, out_w):
+def _source_detail(src):
+    """Where the original already has fine detail, in [0, 1]. Soft areas stay near 0."""
+    energy = _local_detail(src, _BAND_SIGMA)
+    flat = energy.flatten(1)
+    step = max(1, (flat.shape[1] + (1 << 20) - 1) // (1 << 20))
+    sample = flat[:, ::step].contiguous()
+    scale = torch.quantile(sample.float(), 0.90, dim=1).clamp(min=0.02)
+    scale = scale.to(dtype=energy.dtype).view(-1, 1, 1, 1)
+    return (energy / scale).clamp(0.0, 1.0)
+
+
+def _fade_soft_detail(src, up, amount):
+    """Drop model detail where the original was soft. Sharp areas keep it."""
+    if amount <= 0:
+        return up
+    sigma = _BAND_SIGMA * (up.shape[-2] / float(src.shape[-2]))
+    low, high = _split_bands(up, sigma)
+    detail = _source_detail(src)
+    if detail.shape[-2:] != up.shape[-2:]:
+        detail = F.interpolate(
+            detail, size=up.shape[-2:], mode="bilinear", align_corners=False,
+        ).clamp(0.0, 1.0)
+    if detail.device != high.device or detail.dtype != high.dtype:
+        detail = detail.to(device=high.device, dtype=high.dtype)
+    keep = 1.0 - float(amount) * (1.0 - detail)
+    return (low + high * keep).clamp(0.0, 1.0)
+
+
+def _bicubic_rows(src, row0, row1, out_h, out_w, mode="bicubic"):
     """
-    Bicubic sample of output rows ``row0:row1``, matching
+    Sample of output rows ``row0:row1``, matching
     ``interpolate(..., align_corners=False)``. Rows outside the image reflect.
     """
     b = src.shape[0]
@@ -760,11 +788,11 @@ def _bicubic_rows(src, row0, row1, out_h, out_w):
         gy.view(1, -1, 1).expand(b, -1, out_w),
     ), dim=-1)
     return F.grid_sample(
-        src, grid, mode="bicubic", padding_mode="border", align_corners=False,
+        src, grid, mode=mode, padding_mode="border", align_corners=False,
     )
 
 
-def _frequency_combine(src, model_up, sigma):
+def _frequency_combine(src, model_up, sigma, keep_soft=0.0):
     """
     ``blur(bicubic(src)) + (model_up - blur(model_up))`` in row strips.
 
@@ -777,6 +805,7 @@ def _frequency_combine(src, model_up, sigma):
     if _vram_tight(work, model_up.numel() * model_up.element_size()):
         out_device = torch.device("cpu")
     out = torch.empty((b, c, target_h, target_w), device=out_device, dtype=model_up.dtype)
+    detail = _source_detail(src) if keep_soft > 0 else None
     step = _row_strip(target_h, target_w, c)
     for y0 in range(0, target_h, step):
         y1 = min(target_h, y0 + step)
@@ -787,6 +816,13 @@ def _frequency_combine(src, model_up, sigma):
         low_model = _gaussian_blur(model_ctx, sigma)
         model_rows = _on_device(model_up[:, :, y0:y1, :], work)
         high = model_rows - low_model[:, :, radius:radius + (y1 - y0), :]
+        if detail is not None:
+            mask = _bicubic_rows(
+                detail, y0, y1, target_h, target_w, mode="bilinear",
+            ).clamp(0.0, 1.0)
+            if mask.device != high.device or mask.dtype != high.dtype:
+                mask = mask.to(device=high.device, dtype=high.dtype)
+            high = high * (1.0 - keep_soft * (1.0 - mask))
         piece = (low_base + high).clamp(0.0, 1.0)
         out[:, :, y0:y1, :] = piece if piece.device == out_device else piece.to(out_device)
     return out
@@ -1306,6 +1342,10 @@ class SmartEnsembleUpscale:
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                     "tooltip": "How strongly the upscale models replace a plain enlargement. 1 is the ensemble as it is. Lower fades detail back toward that plain resize. Higher exaggerates it. 0 skips the models and only enlarges the picture. Grain, the photo filter, and face strength stay separate. Presets do not change this.",
                 }),
+                "keep_soft": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Leaves soft areas as they were in the original. 1 fades detail the models invent where the original had little fine detail, such as bokeh. Sharp areas keep the models. 0 is off. Presets do not change this.",
+                }),
             },
         }
 
@@ -1322,7 +1362,7 @@ class SmartEnsembleUpscale:
                 download_missing=True, texture_smooth=0.0, reduce_grid=0.0,
                 noise=0.03, photo_filter=_PHOTO_NONE, noise_seed=0,
                 face_enhance=False, face_model_name=_FACE_MODEL,
-                face_strength=1.0, upscale_strength=1.0):
+                face_strength=1.0, upscale_strength=1.0, keep_soft=1.0):
         """
         Main entry point called by ComfyUI.
 
@@ -1385,13 +1425,15 @@ class SmartEnsembleUpscale:
                 if frequency_split:
                     result = self._frequency_separated_upscale(
                         models, rgb, target_hw, tile_size, tile_overlap,
-                        blend_mode, model_names, pbar,
+                        blend_mode, model_names, pbar, keep_soft,
                     )
                 else:
                     result = _ensemble_upscale(
                         models, rgb, target_hw, tile_size, tile_overlap,
                         blend_mode, model_names, pbar,
                     )
+                    if keep_soft > 0:
+                        result = _fade_soft_detail(rgb, result, keep_soft)
                 # Shrink by averaging the source pixels that fall into each
                 # output pixel. 0.5 on a 4× model is a 2×2 mean, not a second
                 # bicubic pass.
@@ -1442,7 +1484,7 @@ class SmartEnsembleUpscale:
     # -------------------------------------------------------------------
     def _frequency_separated_upscale(self, models, img, target_hw, tile_size,
                                      tile_overlap, blend_mode, model_names=None,
-                                     pbar=None):
+                                     pbar=None, keep_soft=0.0):
         """
         Frequency-separated upscaling.
 
@@ -1461,7 +1503,7 @@ class SmartEnsembleUpscale:
             models, img, target_hw, tile_size, tile_overlap, blend_mode,
             model_names, pbar, _BAND_SIGMA,
         )
-        return _frequency_combine(img, model_up, model_sigma)
+        return _frequency_combine(img, model_up, model_sigma, keep_soft)
 
 
 # ---------------------------------------------------------------------------

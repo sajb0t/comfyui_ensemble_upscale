@@ -134,6 +134,7 @@ Editing a model, the noise, the blend, frequency split, texture smooth, reduce g
 | `face_model_name` | 4xFaceUpDAT.pth | Face upscaler. Downloaded when face enhance is on and the file is missing. |
 | `face_strength` | 1 | How much of that face result is kept. 1 is the face model as it is. Lower fades it toward the ensemble. Higher exaggerates the detail. 0 skips the face pass. |
 | `upscale_strength` | 1 | How strongly the models replace a plain enlargement. 1 is the ensemble as it is. Lower fades toward that resize. Higher exaggerates the detail. 0 skips the models. |
+| `keep_soft` | 1 | Leaves soft areas, such as bokeh, as they were. Sharp areas keep the model detail. 0 is off. |
 
 `texture_smooth` and `reduce_grid` stay off unless you raise them. They are for sources that already have grain or a fine checker, not for every photo.
 
@@ -148,5 +149,7 @@ The node takes a ComfyUI image, a float tensor shaped `(batch, height, width, ch
 One upscale model is on the GPU at a time, then moved back to CPU. If the full-size results would fill the GPU, they are blended in strips from CPU memory.
 
 Upscale strength 1 keeps the ensemble. Lower fades it toward a plain enlargement, higher pushes the model detail further, and 0 skips the models. Grain and the photo filter stay on their own controls.
+
+Keep soft is on. It measures fine detail in the original and fades detail the models invent where that measurement is low, such as bokeh. Hair, eyes, and other sharp areas keep the models. Set it to 0 to keep every invented edge. Presets do not change it.
 
 Face enhance is off unless you turn it on. It looks for a frontal face, sharpens that area with the face model, and feathers it back. Face strength 1 keeps that result. Lower fades it toward the ensemble, higher pushes the detail further, and 0 skips the pass. The rest of the picture stays the ensemble. Presets do not change these controls.
