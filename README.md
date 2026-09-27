@@ -20,7 +20,7 @@ Final size is `original × model scale × output_scale`. The default `output_sca
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/sajb0t/comfyui_ensamble_upscale.git
+git clone https://github.com/sajb0t/comfyui_ensemble_upscale.git
 ```
 
 Restart ComfyUI. Connect an image to `image`, then send the output to Save Image or Preview Image. No extra Python packages are required beyond ComfyUI.

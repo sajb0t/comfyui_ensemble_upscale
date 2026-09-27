@@ -78,7 +78,7 @@ function attachPreset(node) {
 }
 
 app.registerExtension({
-    name: "comfyui.ensamble.upscale.presets",
+    name: "comfyui.ensemble.upscale.presets",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "SmartEnsembleUpscale") {
             return;
