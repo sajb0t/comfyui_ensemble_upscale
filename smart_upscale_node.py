@@ -309,6 +309,32 @@ def _model_scale(upscale_model, fallback=4):
     return int(fallback)
 
 
+def _reflect_pad(img, left, right, top, bottom):
+    """Reflect pad. A pad wider than the image is applied in legal steps."""
+    x = img
+    left, right, top, bottom = int(left), int(right), int(top), int(bottom)
+    while left or right or top or bottom:
+        _, _, h, w = x.shape
+        if w <= 1 and (left or right):
+            x = F.pad(x, (left, right, 0, 0), mode="replicate")
+            left = right = 0
+            continue
+        if h <= 1 and (top or bottom):
+            x = F.pad(x, (0, 0, top, bottom), mode="replicate")
+            top = bottom = 0
+            continue
+        pl = min(left, w - 1)
+        pr = min(right, w - 1)
+        pt = min(top, h - 1)
+        pb = min(bottom, h - 1)
+        x = F.pad(x, (pl, pr, pt, pb), mode="reflect")
+        left -= pl
+        right -= pr
+        top -= pt
+        bottom -= pb
+    return x
+
+
 def _gaussian_kernel1d(sigma, device, dtype):
     """Return a normalised 1D Gaussian kernel as a tensor."""
     radius = max(1, int(math.ceil(sigma * 3)))
@@ -335,9 +361,9 @@ def _gaussian_blur(img_bchw, sigma):
     kx = k1d.view(1, 1, 1, -1).repeat(c, 1, 1, 1)
     ky = k1d.view(1, 1, -1, 1).repeat(c, 1, 1, 1)
 
-    x = F.pad(img_bchw, (radius, radius, 0, 0), mode="reflect")
+    x = _reflect_pad(img_bchw, radius, radius, 0, 0)
     x = F.conv2d(x, kx, groups=c)
-    x = F.pad(x, (0, 0, radius, radius), mode="reflect")
+    x = _reflect_pad(x, 0, 0, radius, radius)
     x = F.conv2d(x, ky, groups=c)
     return x
 
@@ -626,7 +652,7 @@ def _rows_with_context(img, y0, y1, radius):
     pad_top = radius - top_have
     pad_bot = radius - bot_have
     if pad_top or pad_bot:
-        sl = F.pad(sl, (0, 0, pad_top, pad_bot), mode="reflect")
+        sl = _reflect_pad(sl, 0, 0, pad_top, pad_bot)
     return sl
 
 
