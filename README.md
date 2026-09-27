@@ -8,13 +8,53 @@ Find it under **image/upscaling** as **Smart Ensemble Upscale**.
 
 The models are chosen from dropdowns. The lists show every file already in `models/upscale_models`, including your own. A preset fills the three dropdowns. **Realistic** is the default: 4xNomos8kSC, RealESRGAN_x4plus, and 4x_NMKD-Superscale. The first model sets the scale, usually 4×. One model skips the blend.
 
-The image is split into tiles so it fits in VRAM. Tile overlaps crossfade color and tone only. Detail comes from the tile whose center is nearest, so two different guesses are not averaged into a soft seam.
+The image is split into tiles so it fits in VRAM. Tile overlaps crossfade color and tone only. Detail comes from the nearer tile center. The two details blend only where those tiles nearly tie.
 
-With more than one model, edges keep detail from the first model. Flat areas take detail from the smoothest model. Color is crossfaded between them. Other blend modes are average, sharpest, and smoothest.
+With more than one model, edges keep detail from the first model. The edge map is taken from that first model. Flat areas take detail from the smoothest model. Color is crossfaded. Detail blends only where the two leading models nearly tie. Other blend modes are average, sharpest, and smoothest.
 
 `frequency_split` is on by default. The original is enlarged with bicubic and blurred with the same cutoff that is removed from the model result. Color and tone stay from the original. Detail comes from the models.
 
-Final size is `original × model scale × output_scale`. The default `output_scale` of **0.5** turns a 4× model into a 2× image. **1.0** keeps the full enlargement.
+Final size is `original × model scale × output_scale`. The default `output_scale` of **0.5** turns a 4× model into a 2× image by averaging each 2×2 block. **1.0** keeps the full enlargement.
+
+## Reconstruction
+
+Let \(I\) be the source and \(U^{(i)}\) an integer-scale ESRGAN. The working grid is \(s\) times the input, where \(s\) is the scale of the first model. If `output_scale` \(\alpha < 1\), that grid is then area-resampled: each output pixel is the mean of the source pixels that cover it. \(\alpha = 1/2\) on a \(4\times\) model is a \(2\times 2\) box mean.
+
+Bands use a separable Gaussian \(G_\sigma\), \(\sigma = 1.5\) input pixels, kernel radius \(\lceil 3\sigma \rceil\), reflection padding. On the upscaled grid the same cutoff is \(\sigma_s = 1.5\, s\):
+
+\[
+L(X) = G_{\sigma_s}(X), \qquad H(X) = X - L(X).
+\]
+
+With frequency split on, color comes from a bicubic enlarge of the source and detail from the model, at one shared cutoff:
+
+\[
+Y = L(\mathrm{bicubic}_s(I)) + H(U_s(I)).
+\]
+
+\(L + H\) is a partition, so the cutoff neither doubles detail nor leaves a hole. One model stops here.
+
+With several models, each output is resampled to the first model's size. The edge map \(E \in [0,1]\) is the Sobel magnitude of the luminance of \(U^{(1)}\), divided by the 90th percentile of a strided sample (floor \(0.02\)). Local detail is the channel-mean absolute high band, blurred again:
+
+\[
+d_i = G_{\sigma_s}\big(\mathrm{mean}_c \lvert H(U^{(i)}) \rvert\big), \qquad \ell_i = d_i / \max_j d_j.
+\]
+
+Content-aware weights sum to 1. \(e_1\) is 1 on the first model:
+
+\[
+w = E\, e_1 + (1-E)\, \mathrm{softmax}(-4\ell).
+\]
+
+Edges therefore keep the first model. Flat areas take the lowest-detail model. `sharpest` is \(\mathrm{softmax}(4\ell)\), `smoothest` is \(\mathrm{softmax}(-4\ell)\), and `average` is the mean of the full images.
+
+Color is \(\sum_i w_i L_i\). Detail keeps the leading model and mixes the runner-up only while their weights differ by less than \(\tau = 0.2\):
+
+\[
+m = \tfrac12 \max\big(0,\; 1 - (w_{(1)}-w_{(2)})/\tau\big), \qquad H = (1-m)\,H_{(1)} + m\,H_{(2)}.
+\]
+
+Tiles use the same split. A separable Gaussian window on \([-1,1]^2\) with \(\sigma = 0.5\), floored at \(10^{-3}\), feather the overlap. Low bands accumulate \(\sum_k \omega_k L_k / \sum_k \omega_k\). High bands use the near-tie rule on those window weights, measured against the larger weight, so two tile guesses are not averaged across the whole overlap.
 
 ## Install
 

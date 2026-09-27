@@ -516,6 +516,9 @@ def _tile_geometry(h, w, tile_size, overlap):
 
 
 _BAND_SIGMA = 1.5
+# Weight gap below this crossfades the two leading detail sources.
+# A wider gap keeps a hard pick so disagreeing detail is not averaged away.
+_HANDOFF = 0.2
 
 
 def _split_bands(img_bchw, sigma):
@@ -523,21 +526,50 @@ def _split_bands(img_bchw, sigma):
     return low, img_bchw - low
 
 
-def _combine_bands(lows, highs, weights):
-    """
-    Crossfade color, keep one model's detail.
+def _pick_high(high_stack, index):
+    """Gather one rank of ``high_stack`` (N,B,C,H,W) using ``index`` (B,1,H,W)."""
+    sel = index.expand(-1, high_stack.shape[2], -1, -1).unsqueeze(0)
+    return high_stack.gather(0, sel).squeeze(0)
 
-    ``weights`` blend the low bands. The high band is taken from the model
-    with the largest weight, so disagreeing detail is not averaged away.
+
+def _handoff_high(high_stack, weights):
     """
+    Detail from the leading source.
+
+    The runner-up is mixed in only while the top two weights are within
+    ``_HANDOFF``. A clear lead stays a hard pick.
+    """
+    if high_stack.shape[0] < 2:
+        return high_stack[0]
+    vals, idx = weights.topk(2, dim=0)
+    winner = _pick_high(high_stack, idx[0])
+    runner = _pick_high(high_stack, idx[1])
+    gap = vals[0] - vals[1]
+    mix = (1.0 - gap / _HANDOFF).clamp(0.0, 1.0) * 0.5
+    return winner * (1.0 - mix) + runner * mix
+
+
+def _combine_bands(lows, highs, weights):
+    """Crossfade color. Detail uses ``_handoff_high``."""
     low = (torch.stack(lows, 0) * weights).sum(dim=0)
-    high_stack = torch.stack(highs, 0)
-    winner = weights.argmax(dim=0, keepdim=True)
-    winner = winner.expand(
-        -1, high_stack.shape[1], high_stack.shape[2], -1, -1,
-    )
-    high = high_stack.gather(0, winner).squeeze(0)
+    high = _handoff_high(torch.stack(highs, 0), weights)
     return low + high
+
+
+def _tile_high_alpha(win, covered):
+    """
+    1 takes the new tile's detail, 0 keeps the stored tile.
+
+    Pixels with no previous tile are always 1. A near tie of the two
+    window weights returns 0.5. A clear lead is a hard pick.
+    """
+    fresh = covered <= 1e-3
+    peak = torch.maximum(win, covered).clamp(min=1e-3)
+    gap = (win - covered).abs()
+    close = (1.0 - gap / (peak * _HANDOFF)).clamp(0.0, 1.0)
+    prefer_new = win >= covered
+    alpha = torch.where(prefer_new, 1.0 - 0.5 * close, 0.5 * close)
+    return torch.where(fresh, torch.ones_like(alpha), alpha)
 
 
 def _blend_weights(details, edge, blend_mode):
@@ -626,8 +658,8 @@ def _gaussian_tiled_scale(img_bchw, upscale_fn, scale, tile_size, overlap,
     Seam-free tiled upscaling.
 
     Overlaps crossfade the low frequency so the color has no seam. Detail
-    comes from the tile whose centre is nearest, so the two guesses are not
-    averaged together.
+    comes from the nearer tile centre. The two details blend only where
+    their window weights nearly tie.
     """
     b, c, h, w = img_bchw.shape
     device, dtype = img_bchw.device, img_bchw.dtype
@@ -664,9 +696,9 @@ def _gaussian_tiled_scale(img_bchw, upscale_fn, scale, tile_size, overlap,
             region = (slice(None), slice(None), slice(oy, oy + exp_h), slice(ox, ox + exp_w))
             low_acc[region] = low_acc[region] + tile_low * win
             covered = best[:, :, oy:oy + exp_h, ox:ox + exp_w]
-            take = win > covered
-            high_acc[region] = torch.where(take, tile_high, high_acc[region])
-            best[:, :, oy:oy + exp_h, ox:ox + exp_w] = torch.where(take, win, covered)
+            alpha = _tile_high_alpha(win, covered)
+            high_acc[region] = high_acc[region] * (1.0 - alpha) + tile_high * alpha
+            best[:, :, oy:oy + exp_h, ox:ox + exp_w] = torch.maximum(covered, win)
             weight[:, :, oy:oy + exp_h, ox:ox + exp_w] += win
 
     output = low_acc / weight.clamp(min=1e-6) + high_acc
@@ -703,11 +735,9 @@ def _ensemble_upscale(models, img_bchw, target_hw, tile_size, overlap,
     if len(results) == 1:
         return results[0]
 
-    # ---- Content-aware ensemble blending ---------------------------------
-    # Reference edge map computed from the average of the model outputs, so
-    # it reflects the actual upscaled structure.
-    ref = torch.stack(results, dim=0).mean(dim=0)
-    edge = _sobel_edges(ref)                       # (B,1,H,W) in [0,1]
+    # Edges come from the first model. That model owns edge detail, so the
+    # map must not be taken from an average that has already cancelled it.
+    edge = _sobel_edges(results[0])
     details = torch.stack([_local_detail(r) for r in results], dim=0)  # (N,B,1,H,W)
     weights = _blend_weights(details, edge, blend_mode)
     weights = weights / weights.sum(dim=0, keepdim=True).clamp(min=1e-6)
@@ -738,9 +768,10 @@ class SmartEnsembleUpscale:
     DESCRIPTION = (
         "Upscales an image with 1–3 ESRGAN models. Edges keep the first "
         "model's detail and flat areas use the smoothest model. Color is "
-        "crossfaded; detail is taken from one model so it is not averaged "
-        "away. Frequency split keeps the original colors. Tile overlaps do "
-        "the same: color blends, detail comes from the nearer tile."
+        "crossfaded. Detail comes from one model, and the two leading "
+        "details blend only where they nearly tie. Frequency split keeps "
+        "the original colors. Tile overlaps do the same. Shrinking the "
+        "result averages source pixels."
     )
 
     @classmethod
@@ -787,7 +818,7 @@ class SmartEnsembleUpscale:
                 }),
                 "output_scale": ("FLOAT", {
                     "default": 0.5, "min": 0.25, "max": 1.0, "step": 0.05,
-                    "tooltip": "Scale the result down afterwards. 0.5 on a 4× model gives 2×. 1.0 keeps the full size.",
+                    "tooltip": "Scale the result down afterwards by averaging source pixels. 0.5 on a 4× model gives 2×. 1.0 keeps the full size.",
                 }),
                 # Keep preset last so older workflows do not shift saved widget values.
                 "preset": ([_CUSTOM, *MODEL_PRESETS.keys()], {
@@ -891,15 +922,14 @@ class SmartEnsembleUpscale:
                     models, rgb, target_hw, tile_size, tile_overlap,
                     blend_mode, model_names, pbar,
                 )
-            # Optional down-scale of the final result.  e.g. run a 4x model
-            # but output at 2x (output_scale=0.5) for higher effective
-            # quality than a direct 2x model.
+            # Shrink by averaging the source pixels that fall into each
+            # output pixel. 0.5 on a 4× model is a 2×2 mean, not a second
+            # bicubic pass.
             if output_scale < 0.999:
                 final_h = max(1, int(round(target_h * output_scale)))
                 final_w = max(1, int(round(target_w * output_scale)))
                 result = F.interpolate(
-                    result, size=(final_h, final_w),
-                    mode="bicubic", align_corners=False,
+                    result, size=(final_h, final_w), mode="area",
                 ).clamp(0.0, 1.0)
 
             result = _apply_photo_filter(result, photo_filter)
