@@ -4,13 +4,23 @@ It makes a picture larger. Choose up to three upscale models. The colors stay fr
 
 ![Smart Ensemble Upscale](node.png)
 
+## Comparisons
+
+Each picture is split down the middle. One side is the original, the other is upscaled.
+
+![Portrait, original and upscaled](comparison-portrait.jpg)
+
+![Cartoon, original and upscaled](comparison-cartoon.jpg)
+
+![Sports photo, original and upscaled](comparison-sports.jpg)
+
 A ComfyUI node that upscales one image with one to three ESRGAN models and puts the result back together so color and detail do not cancel each other out.
 
 Find it under **image/upscaling** as **Smart Ensemble Upscale**.
 
 ## What it does
 
-The models are chosen from dropdowns. The lists show every file already in `models/upscale_models`, including your own. A preset fills the three dropdowns. **Realistic** is the default: 4xNomos8kSC, RealESRGAN_x4plus, and 4x_NMKD-Superscale. The first model sets the scale, usually 4×. One model skips the blend.
+The models are chosen from dropdowns. The lists show every file already in `models/upscale_models`, including your own. A preset fills the three models and the look for that kind of picture. **Realistic** is the default: 4xNomos8kSC, RealESRGAN_x4plus, and 4x_NMKD-Superscale, with a light grain. The first model sets the scale, usually 4×. One model skips the blend.
 
 The image is split into tiles so it fits in VRAM. Tile overlaps crossfade color and tone only. Detail comes from the nearer tile center. The two details blend only where those tiles nearly tie.
 
@@ -87,16 +97,19 @@ Any single-image upscale model that ComfyUI can load (`.pth` or `.safetensors`) 
 
 ## Presets
 
-| Preset | Models |
-| --- | --- |
-| Realistic | 4xNomos8kSC, RealESRGAN_x4plus, 4x_NMKD-Superscale |
-| Anime | 4x-AnimeSharp, RealESRGAN_x4plus_anime_6B, 4x-UltraSharp |
-| Sharp | 4x-UltraSharp, 4x_foolhardy_Remacri, 4xNomos8kSC |
-| Smooth | 4x_NMKD-Superscale, 4xNomos8kSC, RealESRGAN_x4plus |
-| 2x | RealESRGAN_x2plus only |
-| Custom | Uses the three dropdowns as they are |
+| Preset | Models | Noise |
+| --- | --- | --- |
+| Realistic | 4xNomos8kSC, RealESRGAN_x4plus, 4x_NMKD-Superscale | 0.03 |
+| Anime | 4x-AnimeSharp, RealESRGAN_x4plus_anime_6B, 4x-UltraSharp | 0 |
+| Cartoon | 4x-UltraSharp, 4x_foolhardy_Remacri, 4x_NMKD-Siax | 0 |
+| Sharp | 4x-UltraSharp, 4x_foolhardy_Remacri, 4xNomos8kSC | 0.02 |
+| Smooth | 4x_NMKD-Superscale, 4xNomos8kSC, RealESRGAN_x4plus | 0.04 |
+| 2x | RealESRGAN_x2plus only | 0.03 |
+| Custom | Uses the widgets as they are | |
 
-Editing a model dropdown sets the preset to Custom.
+A preset also sets blend to content aware, frequency split on, texture smooth off, reduce grid off, and photo filter to None. Photos keep a little grain. Anime and cartoons stay clean, because grain on flat color looks like noise. Tile size, overlap, output scale, and the noise seed stay where you set them.
+
+Editing a model, the noise, the blend, frequency split, texture smooth, reduce grid, or the photo filter sets the preset to Custom.
 
 ## Parameters
 
@@ -111,7 +124,7 @@ Editing a model dropdown sets the preset to Custom.
 | `blend_mode` | content_aware | How the models are combined. |
 | `frequency_split` | on | Keep original color, take detail from the models. |
 | `output_scale` | 0.5 | Scale the result down after upscaling. 0.25–1.0. |
-| `preset` | Realistic | Switches the three models. |
+| `preset` | Realistic | Sets the models and the look. Custom keeps your widgets. |
 | `texture_smooth` | 0 | Fade fine grain before upscaling. 0 is off. |
 | `reduce_grid` | 0 | Remove a 2-pixel checker from the source. 0 is off. |
 | `noise` | 0.03 | Add grain after upscaling. 0 is off. |
@@ -128,4 +141,4 @@ Editing a model dropdown sets the preset to Custom.
 
 The node takes a ComfyUI image, a float tensor shaped `(batch, height, width, channels)` in the range 0–1. Extra channels are dropped. The output is always RGB.
 
-Models are moved to the GPU for the run and back to the CPU afterwards.
+One upscale model is on the GPU at a time, then moved back to CPU. If the full-size results would fill the GPU, they are blended in strips from CPU memory.

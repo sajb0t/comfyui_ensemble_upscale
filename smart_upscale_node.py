@@ -94,33 +94,69 @@ UPSCALE_MODEL_CATALOG = {
 _NONE = "none"
 _CUSTOM = "Custom"
 
-# None means the three model dropdowns are used as-is.
+
+def _preset_look(noise):
+    """Shared look. Only the grain changes between image types."""
+    return {
+        "noise": noise,
+        "blend_mode": "content_aware",
+        "frequency_split": True,
+        "texture_smooth": 0.0,
+        "reduce_grid": 0.0,
+        "photo_filter": "None",
+    }
+
+
+# None means the widgets are used as they are.
 MODEL_PRESETS = {
-    "Realistic": (
-        "4xNomos8kSC.pth",
-        "RealESRGAN_x4plus.pth",
-        "4x_NMKD-Superscale-SP_178000_G.pth",
-    ),
-    "Anime": (
-        "4x-AnimeSharp.pth",
-        "RealESRGAN_x4plus_anime_6B.pth",
-        "4x-UltraSharp.pth",
-    ),
-    "Sharp": (
-        "4x-UltraSharp.pth",
-        "4x_foolhardy_Remacri.pth",
-        "4xNomos8kSC.pth",
-    ),
-    "Smooth": (
-        "4x_NMKD-Superscale-SP_178000_G.pth",
-        "4xNomos8kSC.pth",
-        "RealESRGAN_x4plus.pth",
-    ),
-    "2x": (
-        "RealESRGAN_x2plus.pth",
-        _NONE,
-        _NONE,
-    ),
+    "Realistic": {
+        "models": (
+            "4xNomos8kSC.pth",
+            "RealESRGAN_x4plus.pth",
+            "4x_NMKD-Superscale-SP_178000_G.pth",
+        ),
+        "settings": _preset_look(0.03),
+    },
+    "Anime": {
+        "models": (
+            "4x-AnimeSharp.pth",
+            "RealESRGAN_x4plus_anime_6B.pth",
+            "4x-UltraSharp.pth",
+        ),
+        "settings": _preset_look(0.0),
+    },
+    "Cartoon": {
+        "models": (
+            "4x-UltraSharp.pth",
+            "4x_foolhardy_Remacri.pth",
+            "4x_NMKD-Siax_200k.pth",
+        ),
+        "settings": _preset_look(0.0),
+    },
+    "Sharp": {
+        "models": (
+            "4x-UltraSharp.pth",
+            "4x_foolhardy_Remacri.pth",
+            "4xNomos8kSC.pth",
+        ),
+        "settings": _preset_look(0.02),
+    },
+    "Smooth": {
+        "models": (
+            "4x_NMKD-Superscale-SP_178000_G.pth",
+            "4xNomos8kSC.pth",
+            "RealESRGAN_x4plus.pth",
+        ),
+        "settings": _preset_look(0.04),
+    },
+    "2x": {
+        "models": (
+            "RealESRGAN_x2plus.pth",
+            _NONE,
+            _NONE,
+        ),
+        "settings": _preset_look(0.03),
+    },
 }
 
 
@@ -228,7 +264,14 @@ def _preset_model_names(preset, model_1_name, model_2_name, model_3_name):
     picked = MODEL_PRESETS.get(preset)
     if picked is None:
         return model_1_name, model_2_name, model_3_name
-    return picked
+    return picked["models"]
+
+
+def _preset_settings(preset):
+    picked = MODEL_PRESETS.get(preset)
+    if picked is None:
+        return None
+    return picked["settings"]
 
 
 def _collect_models(model_1_name, model_2_name, model_3_name, download_missing):
@@ -526,34 +569,174 @@ def _split_bands(img_bchw, sigma):
     return low, img_bchw - low
 
 
-def _pick_high(high_stack, index):
-    """Gather one rank of ``high_stack`` (N,B,C,H,W) using ``index`` (B,1,H,W)."""
-    sel = index.expand(-1, high_stack.shape[2], -1, -1).unsqueeze(0)
-    return high_stack.gather(0, sel).squeeze(0)
+def _free_vram():
+    if _HAS_COMFY:
+        try:
+            model_management.soft_empty_cache()
+        except Exception:
+            pass
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
-def _handoff_high(high_stack, weights):
-    """
-    Detail from the leading source.
+def _vram_tight(device, need_bytes):
+    """True when the next CUDA allocation of about ``need_bytes`` may fail."""
+    if getattr(device, "type", None) != "cuda" or not torch.cuda.is_available():
+        return False
+    free, _total = torch.cuda.mem_get_info(device)
+    return int(free) < int(need_bytes) + (64 << 20)
 
-    The runner-up is mixed in only while the top two weights are within
-    ``_HANDOFF``. A clear lead stays a hard pick.
-    """
-    if high_stack.shape[0] < 2:
-        return high_stack[0]
+
+def _model_to(model, device):
+    try:
+        model.to(device)
+    except Exception:
+        pass
+
+
+def _row_strip(height, width, channels):
+    row_bytes = max(1, int(width) * int(channels) * 4)
+    return max(8, min(int(height), max(1, (32 << 20) // row_bytes)))
+
+
+def _reflect_index(index, length):
+    length = int(length)
+    if length <= 1:
+        return torch.zeros_like(index)
+    period = 2 * length - 2
+    index = torch.remainder(index, period)
+    return torch.where(index < length, index, period - index)
+
+
+def _on_device(tensor, device):
+    if tensor.device == device:
+        return tensor
+    return tensor.to(device)
+
+
+def _rows_with_context(img, y0, y1, radius):
+    """Rows ``y0:y1`` plus ``radius`` of real or reflected context on each side."""
+    _, _, h, _ = img.shape
+    radius = int(radius)
+    if radius <= 0:
+        return img[:, :, y0:y1, :]
+    top_have = min(radius, max(0, y0))
+    bot_have = min(radius, max(0, h - y1))
+    sl = img[:, :, max(0, y0 - top_have):min(h, y1 + bot_have), :]
+    pad_top = radius - top_have
+    pad_bot = radius - bot_have
+    if pad_top or pad_bot:
+        sl = F.pad(sl, (0, 0, pad_top, pad_bot), mode="reflect")
+    return sl
+
+
+def _mix_high(pieces, weights):
+    """Detail from the leading piece. The runner-up mixes in only near a tie."""
+    if len(pieces) < 2:
+        return pieces[0]
     vals, idx = weights.topk(2, dim=0)
-    winner = _pick_high(high_stack, idx[0])
-    runner = _pick_high(high_stack, idx[1])
     gap = vals[0] - vals[1]
     mix = (1.0 - gap / _HANDOFF).clamp(0.0, 1.0) * 0.5
+    winner = torch.zeros_like(pieces[0])
+    runner = torch.zeros_like(pieces[0])
+    for i, piece in enumerate(pieces):
+        winner = torch.where(idx[0] == i, piece, winner)
+        runner = torch.where(idx[1] == i, piece, runner)
     return winner * (1.0 - mix) + runner * mix
 
 
 def _combine_bands(lows, highs, weights):
-    """Crossfade color. Detail uses ``_handoff_high``."""
-    low = (torch.stack(lows, 0) * weights).sum(dim=0)
-    high = _handoff_high(torch.stack(highs, 0), weights)
-    return low + high
+    """
+    Crossfade color and hand off detail, in row strips.
+
+    The full images are never stacked, so the blend does not need another
+    copy of every model result.
+    """
+    ref = lows[0]
+    b, c, h, w = ref.shape
+    work = weights.device
+    out_device = work
+    if _vram_tight(work, ref.numel() * ref.element_size()):
+        out_device = torch.device("cpu")
+    out = torch.empty((b, c, h, w), device=out_device, dtype=ref.dtype)
+    step = _row_strip(h, w, c)
+    n = len(lows)
+    for y0 in range(0, h, step):
+        y1 = min(h, y0 + step)
+        wstrip = _on_device(weights[:, :, :, y0:y1, :], work)
+        low = _on_device(lows[0][:, :, y0:y1, :], work) * wstrip[0]
+        for i in range(1, n):
+            low = low + _on_device(lows[i][:, :, y0:y1, :], work) * wstrip[i]
+        pieces = [_on_device(high[:, :, y0:y1, :], work) for high in highs]
+        mixed = (low + _mix_high(pieces, wstrip)).clamp(0.0, 1.0)
+        out[:, :, y0:y1, :] = mixed if mixed.device == out_device else mixed.to(out_device)
+    return out
+
+
+def _area_shrink(img, out_h, out_w):
+    """Mean of the source pixels that cover each output pixel."""
+    _, _, h, w = img.shape
+    out_h = int(out_h)
+    out_w = int(out_w)
+    if out_h == h and out_w == w:
+        return img
+    if h % out_h == 0 and w % out_w == 0:
+        fh = h // out_h
+        fw = w // out_w
+        b, c = img.shape[:2]
+        pooled = img.reshape(b, c, out_h, fh, out_w, fw).mean(dim=(3, 5))
+        return pooled.clamp(0.0, 1.0)
+    return F.interpolate(img, size=(out_h, out_w), mode="area").clamp(0.0, 1.0)
+
+
+def _bicubic_rows(src, row0, row1, out_h, out_w):
+    """
+    Bicubic sample of output rows ``row0:row1``, matching
+    ``interpolate(..., align_corners=False)``. Rows outside the image reflect.
+    """
+    b = src.shape[0]
+    n = int(row1 - row0)
+    rows = _reflect_index(torch.arange(row0, row1, device=src.device), out_h)
+    cols = torch.arange(out_w, device=src.device)
+    rows = rows.to(dtype=src.dtype)
+    cols = cols.to(dtype=src.dtype)
+    gy = (rows + 0.5) * (2.0 / float(out_h)) - 1.0
+    gx = (cols + 0.5) * (2.0 / float(out_w)) - 1.0
+    grid = torch.stack((
+        gx.view(1, 1, -1).expand(b, n, -1),
+        gy.view(1, -1, 1).expand(b, -1, out_w),
+    ), dim=-1)
+    return F.grid_sample(
+        src, grid, mode="bicubic", padding_mode="border", align_corners=False,
+    )
+
+
+def _frequency_combine(src, model_up, sigma):
+    """
+    ``blur(bicubic(src)) + (model_up - blur(model_up))`` in row strips.
+
+    The enlarged original is never stored as a second full image.
+    """
+    b, c, target_h, target_w = model_up.shape
+    radius = max(1, int(math.ceil(float(sigma) * 3.0)))
+    work = src.device
+    out_device = model_up.device
+    if _vram_tight(work, model_up.numel() * model_up.element_size()):
+        out_device = torch.device("cpu")
+    out = torch.empty((b, c, target_h, target_w), device=out_device, dtype=model_up.dtype)
+    step = _row_strip(target_h, target_w, c)
+    for y0 in range(0, target_h, step):
+        y1 = min(target_h, y0 + step)
+        base_ctx = _bicubic_rows(src, y0 - radius, y1 + radius, target_h, target_w)
+        low_base = _gaussian_blur(base_ctx, sigma)
+        low_base = low_base[:, :, radius:radius + (y1 - y0), :]
+        model_ctx = _on_device(_rows_with_context(model_up, y0, y1, radius), work)
+        low_model = _gaussian_blur(model_ctx, sigma)
+        model_rows = _on_device(model_up[:, :, y0:y1, :], work)
+        high = model_rows - low_model[:, :, radius:radius + (y1 - y0), :]
+        piece = (low_base + high).clamp(0.0, 1.0)
+        out[:, :, y0:y1, :] = piece if piece.device == out_device else piece.to(out_device)
+    return out
 
 
 def _tile_high_alpha(win, covered):
@@ -715,45 +898,78 @@ def _ensemble_upscale(models, img_bchw, target_hw, tile_size, overlap,
     Returns a (B, C, target_h, target_w) tensor in [0, 1].
     """
     device = img_bchw.device
-    results = []
     names = list(model_names or [])
+    average = blend_mode == "average"
+    acc = None
+    count = 0
+    lows = []
+    highs = []
+    details = []
+    edge = None
+    out_sigma = band_sigma * (target_hw[0] / float(img_bchw.shape[-2]))
+    image_bytes = None
+
     for index, m in enumerate(models):
         scale = _model_scale(m)
         label = names[index] if index < len(names) else "model {}".format(index + 1)
         if pbar is not None:
             pbar.set_description("SmartEnsembleUpscale " + label, refresh=False)
-        up = _gaussian_tiled_scale(
-            img_bchw,
-            lambda t, _m=m: _run_model(_m, t),
-            scale, tile_size, overlap, pbar, band_sigma,
-        )
+        # One model on the GPU. The previous full result is not kept beside it.
+        _model_to(m, device)
+        try:
+            up = _gaussian_tiled_scale(
+                img_bchw,
+                lambda t, _m=m: _run_model(_m, t),
+                scale, tile_size, overlap, pbar, band_sigma,
+            )
+        finally:
+            _model_to(m, "cpu")
+            _free_vram()
         if up.shape[-2:] != tuple(target_hw):
             up = F.interpolate(up, size=tuple(target_hw),
                                mode="bicubic", align_corners=False).clamp(0, 1)
-        results.append(up)
+        if len(models) == 1:
+            return up
+        if image_bytes is None:
+            image_bytes = up.numel() * up.element_size()
+        if average:
+            count += 1
+            if acc is None:
+                acc = up
+            elif acc.device.type == "cpu" or _vram_tight(device, image_bytes):
+                acc = acc.cpu() + up.cpu()
+                del up
+            else:
+                acc = acc + up
+                del up
+            continue
+        if lows and _vram_tight(device, image_bytes * 4):
+            lows = [item.cpu() if item.device.type != "cpu" else item for item in lows]
+            highs = [item.cpu() if item.device.type != "cpu" else item for item in highs]
+            _free_vram()
+        if index == 0:
+            edge = _sobel_edges(up)
+        details.append(_local_detail(up))
+        low, high = _split_bands(up, out_sigma)
+        del up
+        if _vram_tight(device, image_bytes * 3):
+            low = low.cpu()
+            high = high.cpu()
+            _free_vram()
+        lows.append(low)
+        highs.append(high)
 
-    if len(results) == 1:
-        return results[0]
+    if average:
+        return (acc / count).clamp(0.0, 1.0)
 
     # Edges come from the first model. That model owns edge detail, so the
     # map must not be taken from an average that has already cancelled it.
-    edge = _sobel_edges(results[0])
-    details = torch.stack([_local_detail(r) for r in results], dim=0)  # (N,B,1,H,W)
-    weights = _blend_weights(details, edge, blend_mode)
+    detail_stack = torch.stack([_on_device(item, device) for item in details], 0)
+    del details
+    weights = _blend_weights(detail_stack, _on_device(edge, device), blend_mode)
+    del detail_stack, edge
     weights = weights / weights.sum(dim=0, keepdim=True).clamp(min=1e-6)
-
-    if blend_mode == "average":
-        stacked = torch.stack(results, dim=0)
-        return stacked.mean(dim=0).clamp(0.0, 1.0)
-
-    out_sigma = band_sigma * (target_hw[0] / float(img_bchw.shape[-2]))
-    lows = []
-    highs = []
-    for result in results:
-        low, high = _split_bands(result, out_sigma)
-        lows.append(low)
-        highs.append(high)
-    return _combine_bands(lows, highs, weights).clamp(0.0, 1.0)
+    return _combine_bands(lows, highs, weights)
 
 
 # ===========================================================================
@@ -823,7 +1039,7 @@ class SmartEnsembleUpscale:
                 # Keep preset last so older workflows do not shift saved widget values.
                 "preset": ([_CUSTOM, *MODEL_PRESETS.keys()], {
                     "default": "Realistic",
-                    "tooltip": "Switches the three models. Custom uses the model choices above. Editing a model sets this to Custom.",
+                    "tooltip": "Sets the models and the look for that kind of picture: noise, blend, frequency split, texture smooth, reduce grid, and photo filter. Custom keeps the widgets as they are. Editing one of those sets this to Custom. Tile size, overlap, output scale, and noise seed stay as you set them.",
                 }),
                 "texture_smooth": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -871,6 +1087,14 @@ class SmartEnsembleUpscale:
         model_1_name, model_2_name, model_3_name = _preset_model_names(
             preset, model_1_name, model_2_name, model_3_name,
         )
+        settings = _preset_settings(preset)
+        if settings is not None:
+            blend_mode = settings["blend_mode"]
+            frequency_split = settings["frequency_split"]
+            texture_smooth = settings["texture_smooth"]
+            reduce_grid = settings["reduce_grid"]
+            noise = settings["noise"]
+            photo_filter = settings["photo_filter"]
         model_names = [
             name for name in (model_1_name, model_2_name, model_3_name)
             if name and name != _NONE
@@ -878,16 +1102,8 @@ class SmartEnsembleUpscale:
         models = _collect_models(
             model_1_name, model_2_name, model_3_name, download_missing,
         )
-
-        # Move models to the compute device (and back to CPU afterwards to
-        # keep VRAM free).
-        moved = []
-        for m in models:
-            try:
-                m.to(device)
-            except Exception:
-                pass
-            moved.append(m)
+        # Each model is moved to the GPU only while its tiles run.
+        moved = models
 
         pbar = None
         try:
@@ -928,9 +1144,7 @@ class SmartEnsembleUpscale:
             if output_scale < 0.999:
                 final_h = max(1, int(round(target_h * output_scale)))
                 final_w = max(1, int(round(target_w * output_scale)))
-                result = F.interpolate(
-                    result, size=(final_h, final_w), mode="area",
-                ).clamp(0.0, 1.0)
+                result = _area_shrink(result, final_h, final_w)
 
             result = _apply_photo_filter(result, photo_filter)
             if noise > 0:
@@ -972,21 +1186,14 @@ class SmartEnsembleUpscale:
         Recombining keeps the original color and the model's detail.
         """
         target_h, target_w = target_hw
-        blur_sigma = _BAND_SIGMA
         in_h = img.shape[-2]
-        model_sigma = blur_sigma * (target_h / float(in_h))
+        model_sigma = _BAND_SIGMA * (target_h / float(in_h))
 
         model_up = _ensemble_upscale(
             models, img, target_hw, tile_size, tile_overlap, blend_mode,
             model_names, pbar, _BAND_SIGMA,
         )
-        base = F.interpolate(
-            img, size=(target_h, target_w),
-            mode="bicubic", align_corners=False,
-        )
-        low_up, _ = _split_bands(base, model_sigma)
-        _, high = _split_bands(model_up, model_sigma)
-        return (low_up + high).clamp(0.0, 1.0)
+        return _frequency_combine(img, model_up, model_sigma)
 
 
 # ---------------------------------------------------------------------------
