@@ -1,6 +1,6 @@
 # Smart Ensemble Upscale
 
-It makes a picture larger. Choose up to three upscale models. The colors stay from the original picture. The detail comes from the models.
+One upscaler always hands you its mistakes. This one runs up to three and keeps only what each does well: sharp edges, clean flat areas, and the color of the original picture.
 
 ![Smart Ensemble Upscale](node.png)
 
