@@ -43,6 +43,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 # ---------------------------------------------------------------------------
 # Optional ComfyUI imports.  We degrade gracefully so the file can be linted /
 # imported outside of a running ComfyUI instance (e.g. for unit tests).
@@ -90,7 +95,10 @@ UPSCALE_MODEL_CATALOG = {
         "https://github.com/Phhofm/models/releases/download/4xNomos8kSC/4xNomos8kSC.pth",
     "RealESRGAN_x2plus.pth":
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+    "4xFaceUpDAT.pth":
+        "https://github.com/Phhofm/models/releases/download/4xFaceUpDAT_Series/4xFaceUpDAT.pth",
 }
+_FACE_MODEL = "4xFaceUpDAT.pth"
 _NONE = "none"
 _CUSTOM = "Custom"
 
@@ -998,6 +1006,181 @@ def _ensemble_upscale(models, img_bchw, target_hw, tile_size, overlap,
     return _combine_bands(lows, highs, weights)
 
 
+_FACE_DETECTOR = None
+
+
+def _face_detector(width, height):
+    global _FACE_DETECTOR
+    if cv2 is None or not hasattr(cv2, "FaceDetectorYN"):
+        raise RuntimeError(
+            "SmartEnsembleUpscale: face enhance needs OpenCV with FaceDetectorYN."
+        )
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "face_detection_yunet_2023mar.onnx",
+    )
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            "SmartEnsembleUpscale: the face detector file is missing."
+        )
+    size = (int(width), int(height))
+    if _FACE_DETECTOR is None:
+        _FACE_DETECTOR = cv2.FaceDetectorYN.create(path, "", size, 0.6, 0.3, 5000)
+    else:
+        _FACE_DETECTOR.setInputSize(size)
+    return _FACE_DETECTOR
+
+
+def _detect_face_boxes(img_bchw):
+    """Frontal faces as (x, y, w, h) on each batch image, in source pixels."""
+    boxes = []
+    rgb = (img_bchw.detach().clamp(0, 1) * 255).to(dtype=torch.uint8).cpu().numpy()
+    for sample in rgb:
+        sample = np.ascontiguousarray(sample.transpose(1, 2, 0))
+        height, width = sample.shape[:2]
+        longest = max(height, width)
+        view = sample
+        scale = 1.0
+        if longest > 1280:
+            scale = 1280.0 / float(longest)
+            view = cv2.resize(
+                sample,
+                (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        bgr = np.ascontiguousarray(view[:, :, ::-1])
+        detector = _face_detector(bgr.shape[1], bgr.shape[0])
+        _count, found = detector.detect(bgr)
+        batch = []
+        if found is not None and len(found):
+            for row in found:
+                x0 = int(round(float(row[0]) / scale))
+                y0 = int(round(float(row[1]) / scale))
+                x1 = int(round(float(row[0] + row[2]) / scale))
+                y1 = int(round(float(row[1] + row[3]) / scale))
+                x0 = max(0, min(width - 1, x0))
+                y0 = max(0, min(height - 1, y0))
+                x1 = max(x0 + 1, min(width, x1))
+                y1 = max(y0 + 1, min(height, y1))
+                if x1 - x0 < 16 or y1 - y0 < 16:
+                    continue
+                batch.append((x0, y0, x1 - x0, y1 - y0))
+        batch.sort(key=lambda item: item[2] * item[3])
+        boxes.append(batch)
+    return boxes
+
+
+def _padded_face_box(box, width, height, pad=0.45):
+    x, y, w, h = box
+    cx = x + w * 0.5
+    cy = y + h * 0.5
+    x0 = int(round(cx - w * (0.5 + pad)))
+    y0 = int(round(cy - h * (0.5 + pad)))
+    x1 = int(round(cx + w * (0.5 + pad)))
+    y1 = int(round(cy + h * (0.5 + pad)))
+    x0 = max(0, min(width - 1, x0))
+    y0 = max(0, min(height - 1, y0))
+    x1 = max(x0 + 1, min(width, x1))
+    y1 = max(y0 + 1, min(height, y1))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return x0, y0, x1, y1
+
+
+def _face_blend_mask(rect_h, rect_w, inner, device, dtype):
+    """1 on the detected face, fading to 0 across the padding around it."""
+    iy0, iy1, ix0, ix1 = inner
+    mask = torch.zeros((1, 1, rect_h, rect_w), device=device, dtype=dtype)
+    mask[:, :, iy0:iy1, ix0:ix1] = 1
+    span = max(1, min(iy1 - iy0, ix1 - ix0))
+    sigma = max(1.0, 0.12 * span)
+    mask = _gaussian_blur(mask, sigma)
+    core_y = max(1, int(round((iy1 - iy0) * 0.15)))
+    core_x = max(1, int(round((ix1 - ix0) * 0.15)))
+    mask[:, :, iy0 + core_y:iy1 - core_y, ix0 + core_x:ix1 - core_x] = 1
+    return mask
+
+
+def _fit_face(face, height, width):
+    if face.shape[-2:] == (height, width):
+        return face
+    if face.shape[-2] >= height and face.shape[-1] >= width:
+        return _area_shrink(face, height, width)
+    return F.interpolate(
+        face, size=(height, width), mode="bicubic", align_corners=False,
+    ).clamp(0.0, 1.0)
+
+
+def _enhance_faces(result, src, boxes, face_model, tile_size, overlap, pbar=None):
+    """Upscale each face from the source and feather it onto ``result``."""
+    device = src.device
+    scale = _model_scale(face_model)
+    label = "face"
+    if pbar is not None:
+        pbar.set_description("SmartEnsembleUpscale " + label, refresh=False)
+    _model_to(face_model, device)
+    try:
+        for index, faces in enumerate(boxes):
+            in_h, in_w = src.shape[-2:]
+            out_h, out_w = result.shape[-2:]
+            for box in faces:
+                padded = _padded_face_box(box, in_w, in_h)
+                if padded is None:
+                    continue
+                x0, y0, x1, y1 = padded
+                crop = src[index:index + 1, :, y0:y1, x0:x1]
+                crop_h, crop_w = crop.shape[-2:]
+                padded_crop = crop
+                extra_h = (16 - crop_h % 16) % 16
+                extra_w = (16 - crop_w % 16) % 16
+                if extra_h or extra_w:
+                    padded_crop = _reflect_pad(crop, 0, extra_w, 0, extra_h)
+                if pbar is not None:
+                    ys, xs = _tile_geometry(padded_crop.shape[-2], padded_crop.shape[-1], tile_size, overlap)
+                    pbar.total += len(ys) * len(xs)
+                    pbar.refresh()
+                face_up = _gaussian_tiled_scale(
+                    padded_crop,
+                    lambda tile, _m=face_model: _run_model(_m, tile),
+                    scale, tile_size, overlap, pbar, _BAND_SIGMA,
+                )
+                keep_h = min(face_up.shape[-2], crop_h * scale)
+                keep_w = min(face_up.shape[-1], crop_w * scale)
+                face_up = face_up[:, :, :keep_h, :keep_w]
+                combined = _frequency_combine(crop, face_up, _BAND_SIGMA * scale)
+                oy0 = int(round(y0 * out_h / float(in_h)))
+                oy1 = int(round(y1 * out_h / float(in_h)))
+                ox0 = int(round(x0 * out_w / float(in_w)))
+                ox1 = int(round(x1 * out_w / float(in_w)))
+                oy0 = max(0, min(out_h - 1, oy0))
+                ox0 = max(0, min(out_w - 1, ox0))
+                oy1 = max(oy0 + 1, min(out_h, oy1))
+                ox1 = max(ox0 + 1, min(out_w, ox1))
+                rect_h, rect_w = oy1 - oy0, ox1 - ox0
+                fitted = _fit_face(combined, rect_h, rect_w)
+                if fitted.device != result.device:
+                    fitted = fitted.to(result.device)
+                fx0 = int(round((box[0] - x0) * rect_w / float(x1 - x0)))
+                fy0 = int(round((box[1] - y0) * rect_h / float(y1 - y0)))
+                fx1 = int(round((box[0] + box[2] - x0) * rect_w / float(x1 - x0)))
+                fy1 = int(round((box[1] + box[3] - y0) * rect_h / float(y1 - y0)))
+                fx0 = max(0, min(rect_w - 1, fx0))
+                fy0 = max(0, min(rect_h - 1, fy0))
+                fx1 = max(fx0 + 1, min(rect_w, fx1))
+                fy1 = max(fy0 + 1, min(rect_h, fy1))
+                mask = _face_blend_mask(
+                    rect_h, rect_w, (fy0, fy1, fx0, fx1), result.device, result.dtype,
+                )
+                region = result[index:index + 1, :, oy0:oy1, ox0:ox1]
+                result[index:index + 1, :, oy0:oy1, ox0:ox1] = (
+                    region * (1.0 - mask) + fitted * mask
+                ).clamp(0.0, 1.0)
+    finally:
+        _model_to(face_model, "cpu")
+        _free_vram()
+    return result
+
+
 # ===========================================================================
 # The ComfyUI node
 # ===========================================================================
@@ -1088,6 +1271,14 @@ class SmartEnsembleUpscale:
                     "control_after_generate": True,
                     "tooltip": "Seed for the added grain. The same seed repeats the same noise.",
                 }),
+                "face_enhance": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "After the ensemble, find each frontal face and sharpen it with the face model. The result is blended back with a soft edge. Off leaves the picture unchanged. No face found leaves it unchanged. Presets do not change this.",
+                }),
+                "face_model_name": (model_names, {
+                    "default": _FACE_MODEL,
+                    "tooltip": "Upscale model used only on detected faces. 4xFaceUpDAT is trained on faces. It is downloaded if missing and download missing is on.",
+                }),
             },
         }
 
@@ -1102,7 +1293,8 @@ class SmartEnsembleUpscale:
                 frequency_split, output_scale, preset="Realistic",
                 model_1_name=_NONE, model_2_name=_NONE, model_3_name=_NONE,
                 download_missing=True, texture_smooth=0.0, reduce_grid=0.0,
-                noise=0.03, photo_filter=_PHOTO_NONE, noise_seed=0):
+                noise=0.03, photo_filter=_PHOTO_NONE, noise_seed=0,
+                face_enhance=False, face_model_name=_FACE_MODEL):
         """
         Main entry point called by ComfyUI.
 
@@ -1171,6 +1363,21 @@ class SmartEnsembleUpscale:
                 final_h = max(1, int(round(target_h * output_scale)))
                 final_w = max(1, int(round(target_w * output_scale)))
                 result = _area_shrink(result, final_h, final_w)
+
+            if face_enhance:
+                face_boxes = _detect_face_boxes(rgb)
+                if any(face_boxes) and _safe_model_filename(face_model_name):
+                    face_model = _load_named_upscale_model(
+                        face_model_name, download_missing,
+                    )
+                    if face_model is not None:
+                        moved.append(face_model)
+                        result = _enhance_faces(
+                            result, rgb, face_boxes, face_model,
+                            tile_size, tile_overlap, pbar,
+                        )
+                elif not any(face_boxes):
+                    logging.info("SmartEnsembleUpscale: no frontal face found")
 
             result = _apply_photo_filter(result, photo_filter)
             if noise > 0:

@@ -130,6 +130,8 @@ Editing a model, the noise, the blend, frequency split, texture smooth, reduce g
 | `noise` | 0.03 | Add grain after upscaling. 0 is off. |
 | `photo_filter` | None | Color grade after upscaling. |
 | `noise_seed` | 0 | Seed for the grain. The same seed repeats the same pattern. |
+| `face_enhance` | off | Find each frontal face and sharpen it with the face model, then blend it back with a soft edge. |
+| `face_model_name` | 4xFaceUpDAT.pth | Face upscaler. Downloaded when face enhance is on and the file is missing. |
 
 `texture_smooth` and `reduce_grid` stay off unless you raise them. They are for sources that already have grain or a fine checker, not for every photo.
 
@@ -142,3 +144,5 @@ Editing a model, the noise, the blend, frequency split, texture smooth, reduce g
 The node takes a ComfyUI image, a float tensor shaped `(batch, height, width, channels)` in the range 0–1. Extra channels are dropped. The output is always RGB.
 
 One upscale model is on the GPU at a time, then moved back to CPU. If the full-size results would fill the GPU, they are blended in strips from CPU memory.
+
+Face enhance is off unless you turn it on. It looks for a frontal face, sharpens that area with the face model, and feathers it back. The rest of the picture stays the ensemble. Presets do not change it.
