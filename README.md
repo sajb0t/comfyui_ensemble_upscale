@@ -1,5 +1,9 @@
 # Smart Ensemble Upscale
 
+It makes a picture larger. Choose up to three upscale models. The colors stay from the original picture. The detail comes from the models.
+
+![Smart Ensemble Upscale](node.png)
+
 A ComfyUI node that upscales one image with one to three ESRGAN models and puts the result back together so color and detail do not cancel each other out.
 
 Find it under **image/upscaling** as **Smart Ensemble Upscale**.
