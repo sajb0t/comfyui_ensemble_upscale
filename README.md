@@ -1,6 +1,6 @@
 # Smart Ensemble Upscale
 
-One upscaler always hands you its mistakes. This one runs up to three and keeps only what each does well: sharp edges, clean flat areas, and the color of the original picture.
+One upscaler always hands you its mistakes. This one runs up to three and keeps only what each does well: sharp edges, clean flat areas, and the color of the original picture. Presets are ready for realistic photos, anime, and cartoons. Grain, photo filters, and texture controls are there when the picture still needs a finish.
 
 ![Smart Ensemble Upscale](node.png)
 
